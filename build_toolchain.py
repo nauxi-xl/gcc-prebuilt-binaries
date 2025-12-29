@@ -1161,7 +1161,10 @@ jobs:
           git \\
           wget \\
           xz-utils \\
-          python3-pip
+          python3-pip \\
+          python3-yaml \\
+          python3-colorama \\
+          python3-requests
     
     - name: 🏗️ Build toolchain
       run: |
