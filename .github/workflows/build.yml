@@ -1,101 +1,93 @@
-name: 🏗️ Build Cross Compiler Toolchain
+name: Multi-Arch Toolchain Release
 
 on:
+  push:
+    tags: [ 'v*' ]
   workflow_dispatch:
     inputs:
-      toolchain:
-        description: 'Toolchain to build'
-        required: true
-        default: 'gcc'
-        type: choice
-        options:
-          - gcc
-          - llvm
-      
-      target:
-        description: 'Target architecture'
-        required: true
-        default: 'x86_64-elf'
-        type: string
-      
-      c_library:
-        description: 'C library to use'
-        required: false
-        default: 'none'
-        type: choice
-        options:
-          - glibc
-          - newlib
-          - musl
-          - none
-      
-      gcc_version:
-        description: 'GCC version (if using GCC)'
-        required: false
-        default: '13.2.0'
-        type: string
-      
-      llvm_version:
-        description: 'LLVM version (if using LLVM)'
-        required: false  
-        default: '17.0.6'
-        type: string
+      tag_name:
+        description: 'Release Tag Name'
+        default: 'manual-build'
+
+permissions:
+  contents: write
 
 jobs:
-  build:
-    runs-on: ubuntu-22.04
-    
+  build-matrix:
+    name: Build ${{ matrix.tool }} (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tool: [gcc, llvm]
+        arch: 
+          - x86_64-elf          # Standard PC
+          - aarch64-none-elf    # ARM64 (Raspberry Pi 3/4/5, Apple Silicon VMs)
+          - riscv64-unknown-elf # RISC-V 64-bit (VisionFive 2, QEMU Virt)
+          - i686-elf            # PC 32-bit (Legacy)
+
     steps:
-    - name: ⬇️ Checkout code
-      uses: actions/checkout@v4
-    
-    - name: 🐍 Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-        cache: 'pip'
-    
-    - name: 📦 Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          build-essential \
-          bison \
-          flex \
-          libgmp-dev \
-          libmpfr-dev \
-          libmpc-dev \
-          texinfo \
-          libisl-dev \
-          ninja-build \
-          cmake \
-          git \
-          wget \
-          xz-utils \
-          python3-pip \
-          python3-venv
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        
-    
-    - name: 🏗️ Build toolchain
-      run: |
-        python3 build_toolchain.py \
-          --toolchain ${{ github.event.inputs.toolchain }} \
-          --target ${{ github.event.inputs.target }} \
-          --c-library ${{ github.event.inputs.c_library }} \
-          --gcc-version ${{ github.event.inputs.gcc_version }} \
-          --prefix ./install \
-          --jobs $(nproc) \
-          --clean-build \
-          --run-tests \
-          --upload-artifact
-    
-    - name: 📤 Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ github.event.inputs.toolchain }}-${{ github.event.inputs.target }}
-        path: |
-          ./build/*.tar.xz
-          ./build/*.sha256
-        retention-days: 7
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get clean
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bison flex texinfo \
+            libgmp-dev libmpfr-dev libmpc-dev \
+            cmake ninja-build python3 zlib1g-dev
+
+      - name: Determine Build Arguments
+        id: args
+        run: |
+          if [ "${{ matrix.tool }}" == "gcc" ]; then
+             echo "BUILD_CMD=--toolchain=gcc --target=${{ matrix.arch }} --enable-libc=none" >> $GITHUB_OUTPUT
+          else
+             # Với LLVM: Build Clang + LLD + Runtimes cho target đó
+             echo "BUILD_CMD=--toolchain=llvm --target=${{ matrix.arch }} --llvm-projects='clang;lld;compiler-rt;libcxx;libcxxabi;libunwind'" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Build
+        run: |
+          chmod +x ./build_toolchain.sh
+          # Gọi script với tham số động từ bước trên
+          ./build_toolchain.sh ${{ steps.args.outputs.BUILD_CMD }} --prefix=${{ github.workspace }}/install --jobs=$(nproc)
+
+      - name: Package
+        run: |
+          cd ${{ github.workspace }}/install
+          TAR_NAME="${{ matrix.arch }}-${{ matrix.tool }}.tar.gz"
+          tar -czvf ../$TAR_NAME .
+          echo "ARTIFACT_NAME=$TAR_NAME" >> $GITHUB_ENV
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_NAME }}
+
+  release:
+    name: Create Release
+    needs: build-matrix
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
+          name: Cross-Toolchain ${{ github.event.inputs.tag_name || github.ref_name }}
+          files: artifacts/*.tar.gz
