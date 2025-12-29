@@ -73,9 +73,10 @@ jobs:
           wget \
           xz-utils \
           python3-pip \
-          python3-yaml \
-          python3-colorama \
-          python3-requests
+          python3-venv
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
     
     - name: 🏗️ Build toolchain
       run: |
