@@ -1,93 +1,98 @@
-name: Multi-Arch Toolchain Release
+name: Build & Publish Toolchain Release
 
 on:
-  push:
-    tags: [ 'v*' ]
   workflow_dispatch:
     inputs:
-      tag_name:
-        description: 'Release Tag Name'
-        default: 'manual-build'
+      gcc_version:
+        description: 'GCC Version'
+        required: true
+        default: '13.2.0'
+        type: string
+      binutils_version:
+        description: 'Binutils Version'
+        required: true
+        default: '2.42'
+        type: string
+      target_arch:
+        description: 'Target Architecture'
+        required: true
+        default: 'x86_64-elf'
+        type: choice
+        options: 
+          - x86_64-elf
+          - aarch64-none-elf
+          - i686-elf
+          - riscv64-unknown-elf
 
+# QUAN TRỌNG: Cấp quyền ghi (write) để Github Actions có thể tạo Release
 permissions:
   contents: write
 
 jobs:
-  build-matrix:
-    name: Build ${{ matrix.tool }} (${{ matrix.arch }})
+  release-toolchain:
+    name: Build ${{ inputs.target_arch }} GCC ${{ inputs.gcc_version }}
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        tool: [gcc, llvm]
-        arch: 
-          - x86_64-elf          # Standard PC
-          - aarch64-none-elf    # ARM64 (Raspberry Pi 3/4/5, Apple Silicon VMs)
-          - riscv64-unknown-elf # RISC-V 64-bit (VisionFive 2, QEMU Virt)
-          - i686-elf            # PC 32-bit (Legacy)
+    timeout-minutes: 360
 
     steps:
-      - name: Checkout Source
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # 1. Dọn dẹp ổ đĩa (Như cũ)
       - name: Free Disk Space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo apt-get clean
 
+      # 2. Cài Dependencies (Như cũ)
       - name: Install Build Dependencies
         run: |
-          sudo apt-get update
+          sudo apt-get update -q
           sudo apt-get install -y \
             build-essential bison flex texinfo \
-            libgmp-dev libmpfr-dev libmpc-dev \
-            cmake ninja-build python3 zlib1g-dev
+            libgmp-dev libmpfr-dev libmpc-dev libisl-dev \
+            wget tar
 
-      - name: Determine Build Arguments
-        id: args
+      # 3. Chạy Script Build
+      - name: Run Build Script
+        env:
+          GCC_VERSION: ${{ inputs.gcc_version }}
+          BINUTILS_VERSION: ${{ inputs.binutils_version }}
+          TARGET: ${{ inputs.target_arch }}
         run: |
-          if [ "${{ matrix.tool }}" == "gcc" ]; then
-             echo "BUILD_CMD=--toolchain=gcc --target=${{ matrix.arch }} --enable-libc=none" >> $GITHUB_OUTPUT
-          else
-             # Với LLVM: Build Clang + LLD + Runtimes cho target đó
-             echo "BUILD_CMD=--toolchain=llvm --target=${{ matrix.arch }} --llvm-projects='clang;lld;compiler-rt;libcxx;libcxxabi;libunwind'" >> $GITHUB_OUTPUT
-          fi
+          chmod +x ./package_toolchain.sh
+          ./package_toolchain.sh
 
-      - name: Run Build
+      # 4. Tạo tên Tag động
+      # Ví dụ Tag sẽ là: toolchain-x86_64-elf-gcc13.2.0
+      - name: Generate Tag Name
+        id: tag
         run: |
-          chmod +x ./build_toolchain.sh
-          # Gọi script với tham số động từ bước trên
-          ./build_toolchain.sh ${{ steps.args.outputs.BUILD_CMD }} --prefix=${{ github.workspace }}/install --jobs=$(nproc)
+          TAG_NAME="toolchain-${{ inputs.target_arch }}-gcc${{ inputs.gcc_version }}"
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_ENV
 
-      - name: Package
-        run: |
-          cd ${{ github.workspace }}/install
-          TAR_NAME="${{ matrix.arch }}-${{ matrix.tool }}.tar.gz"
-          tar -czvf ../$TAR_NAME .
-          echo "ARTIFACT_NAME=$TAR_NAME" >> $GITHUB_ENV
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: ${{ env.ARTIFACT_NAME }}
-
-  release:
-    name: Create Release
-    needs: build-matrix
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-
-    steps:
-      - name: Download All Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: Create Release
+      # 5. Tạo Release và Upload file
+      - name: Create Release & Upload Asset
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
-          name: Cross-Toolchain ${{ github.event.inputs.tag_name || github.ref_name }}
-          files: artifacts/*.tar.gz
+          # Tên tag (nếu chưa có sẽ tự tạo, nếu có rồi sẽ update)
+          tag_name: ${{ env.TAG_NAME }}
+          
+          # Tiêu đề hiển thị của Release
+          name: Cross-Toolchain ${{ inputs.target_arch }} (GCC ${{ inputs.gcc_version }})
+          
+          # Nội dung mô tả
+          body: |
+            Automated build via GitHub Actions.
+            - **Date:** $(date)
+            - **Target:** ${{ inputs.target_arch }}
+            - **GCC:** ${{ inputs.gcc_version }}
+            - **Binutils:** ${{ inputs.binutils_version }}
+          
+          # Đường dẫn tới file cần upload (do script bash tạo ra)
+          files: toolchain_build/*.tar.gz
+          
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

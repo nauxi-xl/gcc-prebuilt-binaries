@@ -1,336 +1,145 @@
 #!/bin/bash
+set -e  # Dừng ngay nếu gặp lỗi
+set -u  # Báo lỗi nếu dùng biến chưa khai báo
 
 # ==============================================================================
-# CONFIGURATION & DEFAULTS
+# 1. CẤU HÌNH (BẠN CÓ THỂ SỬA Ở ĐÂY)
 # ==============================================================================
-set -e # Dừng ngay nếu có lỗi
-set -u # Báo lỗi nếu dùng biến chưa khai báo
 
-# Đường dẫn gốc (Fix lỗi cú pháp $(dir $0))
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SOURCE_DIR="$ROOT_DIR/sources"
-BUILD_ROOT="$ROOT_DIR/build"
-INSTALL_PREFIX="$ROOT_DIR/opt/toolchain"
+# Nếu biến môi trường BINUTILS_VERSION được set (từ Github Actions), dùng nó.
+# Nếu không, dùng mặc định "2.42".
+BINUTILS_VERSION="${BINUTILS_VERSION:-2.42}"
+GCC_VERSION="${GCC_VERSION:-13.2.0}"
 
-GCC_VERSION="15.2.0"
-BINUTILS_VERSION="2.42"
-LLVM_VERSION="21.0.8"
-RUST_VERSION="1.91.0"
-GLIBC_VERSION="2.40"
-NEWLIB_VERSION="4.4.0.20231231"
+# Tương tự với Target
+TARGET="${TARGET:-x86_64-elf}"
 
-# Mặc định
-BUILD_MODE="native"   # native | cross
-TARGET_ARCH=""        # VD: x86_64-elf, aarch64-linux-gnu
-ENABLE_LIBC=""        # glibc | newlib | musl | none
-TOOLCHAINS=""         # Danh sách toolchain cần build (gcc,llvm,rust)
-LLVM_PROJECTS="clang;lld;compiler-rt;libcxx;libcxxabi" # Mặc định cho LLVM
-JOBS=$(nproc)         # Số luồng CPU
+# Số luồng CPU để build (Lấy tối đa)
+JOBS=$(nproc)
 
-DEBUG_MODE=1
+# Tên file kết quả
+OUTPUT_PACKAGE="${TARGET}-gcc${GCC_VERSION}-binutils${BINUTILS_VERSION}.tar.gz"
+
+# Đường dẫn làm việc
+WORK_DIR="$(pwd)/toolchain_build"
+SOURCES_DIR="$WORK_DIR/sources"
+BUILD_DIR="$WORK_DIR/build"
+INSTALL_DIR="$WORK_DIR/install" # Thư mục cài đặt tạm thời
 
 # ==============================================================================
-# LOGGING UTILS
+# 2. HÀM HỖ TRỢ (LOGGING & DOWNLOAD)
 # ==============================================================================
-get_time() { date "+%H:%M:%S"; }
-
-log() {
-    local level=$1
-    local color=$2
-    shift 2
-    local message="$*"
-    printf "%s [%b%-5s%b] %s\n" "$(get_time)" "$color" "$level" "\033[0m" "$message"
-}
-
-info()  { log "INFO"  "\033[0;32m" "$@"; }
-warn()  { log "WARN"  "\033[1;33m" "$@"; }
-error() { log "ERROR" "\033[0;31m" "$@" >&2; }
-debug() { [ "$DEBUG_MODE" -eq 1 ] && log "DEBUG" "\033[0;34m" "$@"; }
-
-# ==============================================================================
-# ARGUMENT PARSING
-# ==============================================================================
-usage() {
-    cat <<EOF
-Usage: $0 [options] ...
-
-Options:
-    --toolchain=<list>      Comma separated list: gcc,llvm,rust,binutils (e.g., "gcc,llvm")
-    --target=<triple>       Target triple (e.g., x86_64-elf). If empty, builds Native.
-    --prefix=<path>         Install directory (default: $INSTALL_PREFIX)
-    --jobs=<n>              Number of parallel jobs (default: $JOBS)
-    
-    --enable-libc=<name>    glibc, newlib, musl.
-    
-    LLVM Specific:
-    --llvm-projects=<list>  Semicolon separated list (clang;lld;polly...)
-    
-    Versions:
-    --gcc-ver=<ver>         Default: $GCC_VERSION
-    --llvm-ver=<ver>        Default: $LLVM_VERSION
-    
-EOF
-    exit 1
-}
-
-while [[ "$#" -gt 0 ]]; do
-    case $1 in
-        --help) usage ;;
-        --toolchain=*) TOOLCHAINS="${1#*=}" ;;
-        --target=*)    TARGET_ARCH="${1#*=}" ;;
-        --prefix=*)    INSTALL_PREFIX="${1#*=}" ;;
-        --source-dir=*) SOURCE_DIR="${1#*=}" ;;
-        --jobs=*)      JOBS="${1#*=}" ;;
-        
-        --enable-libc=*) ENABLE_LIBC="${1#*=}" ;;
-        
-        --llvm-projects=*) LLVM_PROJECTS="${1#*=}" ;;
-        
-        --gcc-ver=*)   GCC_VERSION="${1#*=}" ;;
-        --llvm-ver=*)  LLVM_VERSION="${1#*=}" ;;
-        
-        *) error "Unknown option: $1"; usage ;;
-    esac
-    shift
-done
-
-# ==============================================================================
-# PREPARATION & LOGIC
-# ==============================================================================
+info()  { printf "\033[0;32m[INFO]\033[0m %s\n" "$*"; }
+warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$*"; }
+error() { printf "\033[0;31m[ERROR]\033[0m %s\n" "$*" >&2; exit 1; }
 
 download_and_extract() {
-    local url="$1"
-    local archive_name="$2"
-    local extract_dir_name="$3" # Tên thư mục sau khi giải nén (để check tồn tại)
+    local url=$1
+    local file_name=$(basename "$url")
+    local dir_name=$2
 
-    mkdir -p "$SOURCE_DIR"
-    cd "$SOURCE_DIR"
+    mkdir -p "$SOURCES_DIR"
+    cd "$SOURCES_DIR"
 
-    # Nếu thư mục source chưa tồn tại thì mới tải
-    if [ ! -d "$extract_dir_name" ]; then
-        info "Source '$extract_dir_name' not found. Downloading..."
-        
-        # Tải file nén nếu chưa có
-        if [ ! -f "$archive_name" ]; then
-            wget -q --show-progress "$url" -O "$archive_name"
+    if [ ! -d "$dir_name" ]; then
+        if [ ! -f "$file_name" ]; then
+            info "Downloading $file_name..."
+            wget -q --show-progress "$url"
+        else
+            info "File $file_name already exists. Skipping download."
         fi
         
-        info "Extracting $archive_name..."
-        tar -xf "$archive_name"
-        
-        # Xử lý trường hợp tên thư mục giải nén khác với tên mong đợi (đặc biệt là LLVM)
-        # Ví dụ: llvm giải nén ra "llvm-project-17.0.6.src", ta muốn đổi thành "llvm-project"
-        if [ "$extract_dir_name" == "llvm-project" ]; then
-             # Tìm thư mục vừa giải nén có chữ llvm
-             local actual_dir=$(find . -maxdepth 1 -type d -name "llvm-project*src" | head -n 1)
-             if [ -n "$actual_dir" ]; then
-                mv "$actual_dir" llvm-project
-             fi
-        fi
+        info "Extracting $file_name..."
+        tar -xf "$file_name"
     else
-        info "Source '$extract_dir_name' found. Skipping download."
+        info "Source $dir_name already extracted."
     fi
 }
 
-prepare_sources() {
-    local tool="$1"
-    case $tool in
-        binutils)
-            download_and_extract \
-                "https://ftp.gnu.org/gnu/binutils/binutils-$BINUTILS_VERSION.tar.xz" \
-                "binutils-$BINUTILS_VERSION.tar.xz" \
-                "binutils-$BINUTILS_VERSION"
-            ;;
-        gcc)
-            download_and_extract \
-                "https://ftp.gnu.org/gnu/gcc/gcc-$GCC_VERSION/gcc-$GCC_VERSION.tar.xz" \
-                "gcc-$GCC_VERSION.tar.xz" \
-                "gcc-$GCC_VERSION"
-                
-            # GCC cần tải thêm các prerequisites (gmp, mpfr...)
-            # Chỉ chạy nếu chưa có thư mục gmp bên trong
-            if [ -d "gcc-$GCC_VERSION" ] && [ ! -d "gcc-$GCC_VERSION/gmp" ]; then
-                info "Downloading GCC prerequisites..."
-                cd "gcc-$GCC_VERSION"
-                ./contrib/download_prerequisites
-                cd ..
-            fi
-            ;;
-        llvm)
-            # URL GitHub Release của LLVM
-            download_and_extract \
-                "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/llvm-project-$LLVM_VERSION.src.tar.xz" \
-                "llvm-project-$LLVM_VERSION.src.tar.xz" \
-                "llvm-project"
-            ;;
-    esac
-}
+# ==============================================================================
+# 3. QUÁ TRÌNH BUILD
+# ==============================================================================
 
-# Xác định chế độ Build (Native hay Cross)
-HOST_MACH=$(uname -m)-linux-gnu
-if [[ -z "$TARGET_ARCH" ]]; then
-    info "No target specified. Building NATIVE toolchain for host ($HOST_MACH)."
-    TARGET_ARCH=$HOST_MACH
-    BUILD_MODE="native"
-else
-    info "Target specified: $TARGET_ARCH. Building CROSS toolchain."
-    BUILD_MODE="cross"
+# Chuẩn bị thư mục
+mkdir -p "$BUILD_DIR" "$INSTALL_DIR"
+# Thêm bin vào PATH để GCC tìm thấy Binutils vừa build
+export PATH="$INSTALL_DIR/bin:$PATH"
+
+# --- BƯỚC 1: BINUTILS ---
+info "=== STEP 1/3: BUILD BINUTILS $BINUTILS_VERSION ==="
+
+download_and_extract \
+    "https://ftp.gnu.org/gnu/binutils/binutils-$BINUTILS_VERSION.tar.xz" \
+    "binutils-$BINUTILS_VERSION"
+
+mkdir -p "$BUILD_DIR/binutils"
+cd "$BUILD_DIR/binutils"
+
+if [ ! -f Makefile ]; then
+    info "Configuring Binutils..."
+    "$SOURCES_DIR/binutils-$BINUTILS_VERSION/configure" \
+        --target="$TARGET" \
+        --prefix="$INSTALL_DIR" \
+        --with-sysroot \
+        --disable-nls \
+        --disable-werror
 fi
 
-mkdir -p "$SOURCE_DIR" "$BUILD_ROOT" "$INSTALL_PREFIX"
-export PATH="$INSTALL_PREFIX/bin:$PATH" # Để GCC stage 2 tìm thấy binutils
+info "Compiling Binutils..."
+make -j"$JOBS"
+make install
+info "Binutils installed to $INSTALL_DIR"
 
-# ==============================================================================
-# BUILDERS
-# ==============================================================================
+# --- BƯỚC 2: GCC ---
+info "=== STEP 2/3: BUILD GCC $GCC_VERSION ==="
 
-build_binutils() {
-    prepare_sources "binutils"
+download_and_extract \
+    "https://ftp.gnu.org/gnu/gcc/gcc-$GCC_VERSION/gcc-$GCC_VERSION.tar.xz" \
+    "gcc-$GCC_VERSION"
 
-    info "Building Binutils $BINUTILS_VERSION for $TARGET_ARCH..."
-    local bdir="$BUILD_ROOT/binutils-$TARGET_ARCH"
-    mkdir -p "$bdir" && cd "$bdir"
-    
-    # Download source logic here (omitted for brevity) - giả sử source đã có
-    # Check if configured
-    if [ ! -f Makefile ]; then
-        "$SOURCE_DIR/binutils-$BINUTILS_VERSION/configure" \
-            --target="$TARGET_ARCH" \
-            --prefix="$INSTALL_PREFIX" \
-            --with-sysroot="$INSTALL_PREFIX/$TARGET_ARCH/sysroot" \
-            --disable-nls \
-            --disable-werror \
-            --enable-plugins \
-            --enable-gold=yes
-    fi
-    
-    make -j"$JOBS"
-    make install
-    info "Binutils installed."
-}
+# Tự động tải prerequisites (GMP, MPFR, MPC) vào trong source tree của GCC
+if [ ! -d "$SOURCES_DIR/gcc-$GCC_VERSION/gmp" ]; then
+    info "Downloading GCC prerequisites (gmp, mpfr, mpc)..."
+    cd "$SOURCES_DIR/gcc-$GCC_VERSION"
+    ./contrib/download_prerequisites
+fi
 
-build_gcc() {
-    prepare_sources "gcc"
+mkdir -p "$BUILD_DIR/gcc"
+cd "$BUILD_DIR/gcc"
 
-    info "Building GCC $GCC_VERSION ($BUILD_MODE)..."
-    local bdir="$BUILD_ROOT/gcc-$TARGET_ARCH"
-    mkdir -p "$bdir" && cd "$bdir"
+if [ ! -f Makefile ]; then
+    info "Configuring GCC..."
+    # LƯU Ý: Đây là cấu hình cho OS Dev (Freestanding, no libc)
+    "$SOURCES_DIR/gcc-$GCC_VERSION/configure" \
+        --target="$TARGET" \
+        --prefix="$INSTALL_DIR" \
+        --disable-nls \
+        --enable-languages=c,c++ \
+        --without-headers \
+        --disable-shared \
+        --disable-multilib \
+        --disable-threads \
+        --disable-libgomp \
+        --disable-libssp
+fi
 
-    # Common Configs
-    local conf_opts=(
-        "--target=$TARGET_ARCH"
-        "--prefix=$INSTALL_PREFIX"
-        "--disable-nls"
-        "--enable-languages=c,c++"
-        "--disable-multilib"
-    )
+info "Compiling GCC (This may take a while)..."
+make -j"$JOBS" all-gcc
+make install-gcc
 
-    if [[ "$BUILD_MODE" == "cross" ]]; then
-        # Cross-Compiler Config
-        if [[ -z "$ENABLE_LIBC" ]]; then
-            # Stage 1 (Freestanding / Kernel Dev)
-            conf_opts+=( "--without-headers" "--with-newlib" "--disable-shared" "--disable-threads" "--disable-libssp" )
-        else
-            # Stage 2 (With Libc)
-            conf_opts+=( "--with-sysroot=$INSTALL_PREFIX/$TARGET_ARCH/sysroot" )
-        fi
-    else
-        # Native Config (Build compiler CHẠY TRÊN máy này)
-        conf_opts+=( "--enable-shared" "--enable-threads=posix" "--with-system-zlib" )
-    fi
+info "Compiling Libgcc..."
+make -j"$JOBS" all-target-libgcc
+make install-target-libgcc
 
-    # Prerequisites (GMP/MPFR/MPC) handled inside GCC source usually via ./contrib/download_prerequisites
-    
-    if [ ! -f Makefile ]; then
-        "$SOURCE_DIR/gcc-$GCC_VERSION/configure" "${conf_opts[@]}"
-    fi
+# --- BƯỚC 3: ĐÓNG GÓI ---
+info "=== STEP 3/3: PACKAGING ==="
 
-    make -j"$JOBS" all-gcc
-    make install-gcc
-    
-    # Nếu không phải freestanding mode thì build tiếp libgcc
-    if [[ "$BUILD_MODE" == "native" ]] || [[ -n "$ENABLE_LIBC" ]]; then
-         make -j"$JOBS" all-target-libgcc
-         make install-target-libgcc
-    fi
-    info "GCC installed."
-}
+cd "$WORK_DIR"
+info "Creating archive: $OUTPUT_PACKAGE"
 
-build_llvm() {
-    prepare_sources "llvm"
-    info "Building LLVM $LLVM_VERSION ($BUILD_MODE)..."
-    local bdir="$BUILD_ROOT/llvm-$TARGET_ARCH"
-    mkdir -p "$bdir" && cd "$bdir"
+# Nén nội dung thư mục install (nhưng không lấy folder cha install/)
+tar -czf "$OUTPUT_PACKAGE" -C "$INSTALL_DIR" .
 
-    # CMake Flags cơ bản
-    local cmake_flags=(
-        "-G Ninja"
-        "-DCMAKE_BUILD_TYPE=Release"
-        "-DCMAKE_INSTALL_PREFIX=$INSTALL_PREFIX"
-        "-DLLVM_ENABLE_PROJECTS=$LLVM_PROJECTS"
-        "-DLLVM_ENABLE_RUNTIMES=libcxx;libcxxabi;libunwind" # Optional, tùy user
-        "-DLLVM_TARGETS_TO_BUILD=X86;ARM;AArch64" # Tùy chọn, build hết thì lâu
-    )
-
-    if [[ "$BUILD_MODE" == "cross" ]]; then
-        # Cấu hình Cross LLVM:
-        # LLVM bản chất là Cross-compiler sẵn. Nhưng nếu muốn libs (libc++, compiler-rt)
-        # chạy trên Target, ta phải set LLVM_DEFAULT_TARGET_TRIPLE.
-        cmake_flags+=(
-            "-DLLVM_DEFAULT_TARGET_TRIPLE=$TARGET_ARCH"
-            # Nếu build cho bare-metal
-            "-DLLVM_ENABLE_PER_TARGET_RUNTIME_DIR=ON" 
-        )
-    fi
-
-    cmake "$SOURCE_DIR/llvm-project" "${cmake_flags[@]}"
-    ninja -j"$JOBS"
-    ninja install
-    info "LLVM installed."
-}
-
-build_rust() {
-    info "Building Rust $RUST_VERSION..."
-    # Rust cần file config.toml phức tạp.
-    # Logic build Rust từ source thường gọi ./x.py
-    
-    cd "$SOURCE_DIR/rust"
-    
-    # Tạo config.toml động
-    cat <<EOF > config.toml
-[build]
-target = ["$TARGET_ARCH"]
-[install]
-prefix = "$INSTALL_PREFIX"
-[rust]
-channel = "stable"
-EOF
-
-    ./x.py build -j "$JOBS"
-    ./x.py install
-    info "Rust installed."
-}
-
-# ==============================================================================
-# MAIN EXECUTION LOOP
-# ==============================================================================
-
-# Tách chuỗi toolchain (vd: "gcc,llvm" -> mảng)
-IFS=',' read -ra ADDR <<< "$TOOLCHAINS"
-
-for tool in "${ADDR[@]}"; do
-    case $tool in
-        binutils) build_binutils ;;
-        gcc)      
-            # Thường phải build binutils trước GCC
-            build_binutils
-            build_gcc 
-            ;;
-        llvm)     build_llvm ;;
-        rust)     build_rust ;;
-        *)        warn "Skipping unknown toolchain: $tool" ;;
-    esac
-done
-
-info "All requested toolchains built successfully!"
-info "Toolchain location: $INSTALL_PREFIX"
+info "SUCCESS!"
+info "Toolchain Package: $WORK_DIR/$OUTPUT_PACKAGE"
+info "Size: $(du -h "$OUTPUT_PACKAGE" | cut -f1)"
