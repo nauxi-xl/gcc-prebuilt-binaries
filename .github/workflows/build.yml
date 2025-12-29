@@ -60,8 +60,8 @@ jobs:
           BINUTILS_VERSION: ${{ inputs.binutils_version }}
           TARGET: ${{ inputs.target_arch }}
         run: |
-          chmod +x ./package_toolchain.sh
-          ./package_toolchain.sh
+          chmod +x ./build_toolchain.sh
+          ./build_toolchain.sh
 
       # 4. Tạo tên Tag động
       # Ví dụ Tag sẽ là: toolchain-x86_64-elf-gcc13.2.0
