@@ -1,0 +1,97 @@
+name: Build Cross Compiler Toolchain
+
+on:
+  workflow_dispatch:
+    inputs:
+      toolchain:
+        description: 'Toolchain to build'
+        required: true
+        default: 'gcc'
+        type: choice
+        options:
+          - gcc
+          - llvm
+      
+      target:
+        description: 'Target architecture'
+        required: true
+        default: 'x86_64-elf'
+        type: string
+      
+      c_library:
+        description: 'C library to use'
+        required: false
+        default: 'none'
+        type: choice
+        options:
+          - glibc
+          - newlib
+          - musl
+          - none
+      
+      gcc_version:
+        description: 'GCC version (if using GCC)'
+        required: false
+        default: '13.2.0'
+        type: string
+      
+      llvm_version:
+        description: 'LLVM version (if using LLVM)'
+        required: false  
+        default: '17.0.6'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    
+    steps:
+    - name: ⬇️ Checkout code
+      uses: actions/checkout@v4
+    
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+    
+    - name: 📦 Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          bison \
+          flex \
+          libgmp-dev \
+          libmpfr-dev \
+          libmpc-dev \
+          texinfo \
+          libisl-dev \
+          ninja-build \
+          cmake \
+          git \
+          wget \
+          xz-utils \
+          python3-pip
+    
+    - name: 🏗️ Build toolchain
+      run: |
+        python3 build_toolchain.py \
+          --toolchain ${{ github.event.inputs.toolchain }} \
+          --target ${{ github.event.inputs.target }} \
+          --c-library ${{ github.event.inputs.c_library }} \
+          --gcc-version ${{ github.event.inputs.gcc_version }} \
+          --prefix ./install \
+          --jobs $(nproc) \
+          --clean-build \
+          --run-tests \
+          --upload-artifact
+    
+    - name: 📤 Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ github.event.inputs.toolchain }}-${{ github.event.inputs.target }}
+        path: |
+          ./build/*.tar.xz
+          ./build/*.sha256
+        retention-days: 7
